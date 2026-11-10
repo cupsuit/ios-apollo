@@ -1,6 +1,17 @@
 # project-BadApple (iOS 16 on the Xiaomi Mi 10T 5G, apollo) - working notes
 
 ## Agent handoff / active work
+
+### >>> SECOND PHONE (2026-11-10, fork cupsuit/ios-apollo): M2007J3SY (Mi 10T Pro, 8 GB, PixelOS 14 ABL), Windows host + Kali WSL <<<
+
+- **Host:** Windows 10 + WSL2 Kali with a self-built WSL kernel (HFS+ on); apfs-fuse built from source (`-include cstdint`); fastboot/adb from Windows. Root built with build-ios-root.sh steps 2-4, flashed with `fastboot flash -S 512M userdata` (24 chunks, 349 s); the next `fastboot boot` hung -> Vol-Down+Power, as documented.
+- **Boot 1-2: "LOADER no initrd in /chosen".** Shim bug, not ABL: find_chosen_property() never cleared child_stack[] for a new node, so a node whose earlier sibling had children rejected its own properties and the whole tree failed. Host build of shim/fdt.c on this phone's live FDT: not found before, initrd 0xadff7000..0xafffe312 after. Fix = commit 95ee33f (one line).
+- **Boot 2 (76 min at the Apple logo): not a slow migration.** SpringBoard crash-looped 51x: "Failed to load bounding path bitmap ... BoundingPathBitmap-1125x2436-375x812-3.00x"; iOS gave 0 frames. Cause: research/ipsw-x/d22ap.adt missing (mkadt.py only warns, so the ADT had no /product). DeviceTree.d22ap.im4p from the IPSW -> IM4P payload -> LZFSE -> d22ap.adt (186084 bytes) fixed it: boot 3 came up.
+- **Boot 4/5 (GL bridge, --display-height 2502, --artwork-subtype 2556, audio-on + ADSP + haptic + mic lists, options apollo_rtc/power/torch/sweetbattery; boot 5 also quiet list + com.apple.driverkitd disabled):** touch, Wi-Fi, sound, vibration, island, date, power off work; 45-58 fps when active. Open: Settings > Notifications crashes; battery always 100%; Control Center icons garbled; black bars only in Spotlight; lag.
+- **Settings crash (symbolicated):** pc 0 in CI::GLContext::init <- +[CIContext internalContextWithEAGLContext:options:] <- IconServices +[CIContext _MI_sharedIconCompositorContext] <- __LICGImageCreateCoreImageLanczosScaled. CoreImage takes GL without a Metal device and GL is not usable outside backboardd. Commit b720ee2 (libsweet-ui): no Metal device -> that shared context with kCIContextUseSoftwareRenderer. Guess: also behind garbled app icons. NOT built yet.
+- **Battery 100%:** this phone's PM8150B gauge is qcom,fg-gen4 (live FDT: BATT_SOC 0x4000, BATT_INFO 0x4100, RRADC 0x4200, MEM_IF 0x4300); 0x4800 reads type 0. xnu 0188 (commit b638ca7) reads BATT_SOC_FG_MONOTONIC_SOC 0x4009 (0..255). NOT built yet.
+- **CI:** GitHub Actions partial outage 2026-11-10 16:10 UTC: xnu run 42859655075 queued, ui runs 42855176731/42858027213 cancelled in the queue. b720ee2 is local only (push after the outage).
+
  
 ### >>> UFS MILESTONE 5 (2026-10-31): controller, GPT and read-only partition probing verified <<<
 
