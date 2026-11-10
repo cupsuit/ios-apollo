@@ -1,0 +1,93 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -73,6 +73,46 @@
+ 	return v;
+ }
+ 
++/*
++ * apollo (xnu 0189): the Mi 10T's device tree puts the controller behind the apps SMMU (ssusb iommus =
++ * <&apps_smmu 0x0 0x0>, qcom,iommu-dma "atomic"), while this driver gives it physical addresses. What the
++ * stream (SID 0) gets after ABL, read only: sCR0 (CLIENTPD bit 0 = SMMU off, USFCFG bit 10 = unmatched
++ * streams fault), and every valid SMR that matches SID 0 with its S2CR (type 0 translate, 1 bypass,
++ * 2 fault; CBNDX bits 7:0). Register layout: ARM SMMUv2 global space 0 (Linux arm-smmu.h).
++ */
++#define APPS_SMMU_PA            0x15000000
++static void
++sweet_usb_smmu_report(void)
++{
++	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, 0x1000);
++	if (smmu == 0) {
++		printf("SWEET USB: apps SMMU map failed
++");
++		return;
++	}
++	uint32_t scr0 = usb_rd(smmu, 0x0), idr0 = usb_rd(smmu, 0x20);
++	unsigned nsmr = idr0 & 0xffu, matched = 0;
++	printf("SWEET USB: apps SMMU sCR0 0x%08x (CLIENTPD %u USFCFG %u) IDR0 0x%08x (%u SMRs)
++",
++	    scr0, scr0 & 1u, (scr0 >> 10) & 1u, idr0, nsmr);
++	for (unsigned n = 0; n < nsmr && n < 128; n++) {
++		uint32_t smr = usb_rd(smmu, 0x800 + 4 * n);
++		uint32_t id = smr & 0xffffu, mask = (smr >> 16) & 0x7fffu;
++		if (!(smr & (1u << 31)) || (id & ~mask) != 0) {
++			continue;
++		}
++		uint32_t s2cr = usb_rd(smmu, 0xc00 + 4 * n);
++		printf("SWEET USB: SMR%u 0x%08x (id 0x%x mask 0x%x) S2CR 0x%08x (type %u, CB %u)
++",
++		    n, smr, id, mask, s2cr, (s2cr >> 16) & 3u, s2cr & 0xffu);
++		matched++;
++	}
++	if (matched == 0) {
++		printf("SWEET USB: no SMR matches SID 0: %s
++", (scr0 >> 10) & 1u ? "unmatched streams FAULT" : "unmatched streams bypass");
++	}
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -117,6 +157,7 @@
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
++		sweet_usb_smmu_report();
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+@@ -877,12 +918,23 @@
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	/*
++	 * apollo (xnu 0189): this controller is a DWC_usb31 (GSNPSID 0x3331xxxx; sweet's is DWC_usb3). Linux
++	 * dwc3_core_soft_reset() waits 50 ms after CSFTRST clears before the PHY clock domain is touched (DWC_usb31
++	 * 1.80a and earlier). Without it the USB thread stopped right after the line above on apollo (boot 7, no
++	 * further message, phone reset later): wait as Linux does.
++	 */
++	delay(50 * 1000);
++	printf("SWEET USB: step: 50 ms synchronisation wait done
++");
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
++	printf("SWEET USB: step: event buffer at 0x%llx
++", ud.dma_pa + UD_EVT);
+ 
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+@@ -900,7 +952,11 @@
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
++	printf("SWEET USB: step: endpoint 0 configured, starting the setup transfer
++");
+ 	ud_start_setup();
++	printf("SWEET USB: step: setup transfer started
++");
+ 
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
