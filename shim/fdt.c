@@ -235,6 +235,8 @@ is_chosen = (depth == 1 &&
 if (depth)
     child_stack[depth - 1] = 1;
 chosen_stack[depth] = (uint8_t)is_chosen;
+/* a new node starts with no children (the slot may hold a closed sibling's flag) */
+child_stack[depth] = 0;
 depth++;
 
 pos = start + name_len + 1;
