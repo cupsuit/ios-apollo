@@ -25,11 +25,20 @@
  * mediaserverd's camera for a torch, which this port does not have, so iOS's button stays off. Here AVFlashlight says
  * it has one and drives the kernel's: sysctl apollo.torch (xnu 0181, mkadt --option apollo_torch=1; mA per channel),
  * levels 0..1 as 0..150 mA.
+ *
+ * Icons through CoreImage (every process this is inserted in). With no Metal device (no sweetmtl), CoreImage makes
+ * an OpenGL ES context, and outside backboardd (the only process the GL bridge is in) CI::GLContext::init calls a NULL
+ * GL entry: Settings > Notifications crashed with pc 0 in IconServices' +[CIContext _MI_sharedIconCompositorContext]
+ * (Lanczos-scaling the apps' icons; apollo boot 4, symbolicated with ipsw against 20H392's shared cache), and icons
+ * scaled through that context elsewhere come out as garbage. When MTLCreateSystemDefaultDevice() gives no device, that
+ * shared context is made with kCIContextUseSoftwareRenderer instead (CPU, slower, correct). SWEET_UI_CI_GPU=1 in
+ * the environment leaves it alone.
  */
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
 
@@ -183,12 +192,58 @@ sweet_flashlight_start(void)
 	NSLog(@"sweet-ui: iOS's flashlight drives apollo.torch (now %d mA)", ma);
 }
 
+static NSString *sweet_ci_software_key;
+
+/* +[CIContext _MI_sharedIconCompositorContext] (IconServices): the same one shared context, made on the CPU */
+static id
+sweet_icon_compositor(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+	static id context;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		NSDictionary *options = @{sweet_ci_software_key: @YES};
+		context = ((id (*)(Class, SEL, NSDictionary *))objc_msgSend)(NSClassFromString(@"CIContext"),
+		    sel_registerName("contextWithOptions:"), options);
+		NSLog(@"sweet-ui: icon compositor context on the CPU: %@", context);
+	});
+	return context;
+}
+
+static void
+sweet_coreimage_start(void)
+{
+	if (getenv("SWEET_UI_CI_GPU") != NULL) {
+		return;
+	}
+	void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+	id (*mtl_default)(void) = metal != NULL ? (id (*)(void))dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
+	if (mtl_default != NULL && mtl_default() != nil) {
+		return;		/* a Metal device: CoreImage uses it, not GL */
+	}
+	void *ci = dlopen("/System/Library/Frameworks/CoreImage.framework/CoreImage", RTLD_LAZY);
+	(void)dlopen("/System/Library/PrivateFrameworks/IconServices.framework/IconServices", RTLD_LAZY);
+	NSString *const *key = ci != NULL ? (NSString *const *)dlsym(ci, "kCIContextUseSoftwareRenderer") : NULL;
+	sweet_ci_software_key = key != NULL && *key != nil ? *key : @"software_renderer";
+	Class cls = NSClassFromString(@"CIContext");
+	if (cls == Nil) {
+		NSLog(@"sweet-ui: no CIContext: icons left as they are");
+		return;
+	}
+	sweet_replace(cls, NSSelectorFromString(@"_MI_sharedIconCompositorContext"), (IMP)sweet_icon_compositor, YES);
+	NSLog(@"sweet-ui: no Metal device: IconServices' compositor uses CoreImage's software renderer (%@)",
+	    sweet_ci_software_key);
+}
+
 __attribute__((constructor))
 static void
 sweet_ui_start(void)
 {
 	@autoreleasepool {
 		sweet_flashlight_start();
+		sweet_coreimage_start();
 		const char *env = getenv("SWEET_UI_STATUS_BAR");
 		NSString *name = env != NULL && *env != '\0' ? @(env) : @"_UIStatusBarVisualProvider_DynamicSplitMedium";
 
