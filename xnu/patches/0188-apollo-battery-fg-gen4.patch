@@ -1,0 +1,69 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -102,7 +102,9 @@
+ 	/* apollo (xnu 0182): SID 2 too, the Mi 10T's PM8150B (charger + fuel gauge; sweet's PM6150 is SID 0) */
+ 	if (!sp_ready || !out || (sid != 0 && sid != 2) || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 &&
++	    /* apollo (xnu 0188): the PM8150B's FG Gen4 blocks (BATT_SOC, BATT_INFO, RRADC) */
++	    peripheral != 0x40 && peripheral != 0x41 && peripheral != 0x42)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -244,7 +244,42 @@
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		/*
++		 * apollo (xnu 0188): the Mi 10T has no QG at 0x4800 (it reads type 0): its device tree's PM8150B
++		 * gauge is qcom,fg-gen4 (BATT_SOC 0x4000, BATT_INFO 0x4100, RRADC 0x4200, MEM_IF 0x4300). The
++		 * gauge's own algorithm runs in the PMIC; Linux reads its result from BATT_SOC_FG_MONOTONIC_SOC
++		 * (BATT_SOC + 0x09, 0..255, fg_get_msoc_raw / FULL_SOC_RAW 255 in qpnp-fg-gen4.c). The voltage
++		 * is in the gauge's SRAM (not read here): a nominal 3850 mV is published with it.
++		 */
++		uint8_t fgType = 0, msoc = 0;
++		bool fg = fReal &&
++		    !sweet_spmi_read(sid, 0x4004, &fgType) && fgType != 0 &&
++		    !sweet_spmi_read(sid, 0x4009, &msoc) &&
++		    !sweet_spmi_read(sid, 0x1310, &usb) &&
++		    !sweet_spmi_read(sid, 0x110b, &path) &&
++		    !sweet_spmi_read(sid, 0x1006, &charger) &&
++		    !sweet_spmi_read(sid, 0x1007, &error) &&
++		    !sweet_spmi_read(sid, 0x100d, &temperature);
++		if (fReal && (fPolls % 10) == 1) {
++			IOLog("SWEET BATTERY: FG Gen4 type %#x monotonic SOC raw %u (%u%%); usb %#x path %#x charger %#x "
++			    "error %#x; %s\n", fgType, msoc, (msoc * 100u + 127u) / 255u, usb, path, charger, error,
++			    fg ? "read" : "NOT read");
++		}
++		if (!fg) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++			return;
++		}
++		unsigned fgPercent = (msoc * 100u + 127u) / 255u;
++		if (fgPercent > 100) {
++			fgPercent = 100;
++		}
++		bool fgExternal = (usb & 0x10u) != 0;
++		bool fgCapable = fgExternal && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++		unsigned fgState = charger & 7u;
++		bool fgCharging = fgCapable && fgState >= 1 && fgState <= 4 &&
++		    !(error & 2u) && !(temperature & 0x0cu);
++		bool fgFull = fgExternal && fgState == 5 && !(error & 2u);
++		publish(fgFull ? 100 : fgPercent, 3850, 0, fgExternal, fgCapable, fgCharging, fgFull, true, false);
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
+@@ -290,7 +325,8 @@
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	if (fReal) {
+ 		/* apollo (xnu 0182): what answers at the charger's and the gauge's blocks (boot 121: all zeros, "NOT read") */
+-		static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x48};
++		/* apollo (xnu 0188): + the FG Gen4 blocks */
++		static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x48, 0x40, 0x41, 0x42};
+ 		for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); ++i) {
+ 			uint8_t type = 0, subtype = 0;
+ 			bool ok = !sweet_spmi_read(sweet_battery_sid, blocks[i] << 8 | 0x04, &type) &&
