@@ -1,0 +1,54 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -81,6 +81,7 @@
+  * 2 fault; CBNDX bits 7:0). Register layout: ARM SMMUv2 global space 0 (Linux arm-smmu.h).
+  */
+ #define APPS_SMMU_PA            0x15000000
++static bool sweet_usb_smmu_blocked;
+ static void
+ sweet_usb_smmu_report(void)
+ {
+@@ -107,6 +108,32 @@
+ 	if (matched == 0) {
+ 		printf("SWEET USB: no SMR matches SID 0: %s\n", (scr0 >> 10) & 1u ? "unmatched streams FAULT" : "unmatched streams bypass");
+ 	}
++	/*
++	 * apollo (xnu 0190): boot 8 stopped at the first DMA (the setup TRB fetch) with exactly that: SMMU on,
++	 * unmatched streams fault, no SMR for SID 0 (ABL's is gone by now), and the fault reset the phone.
++	 * Linux maps the stream through its own SMR + context bank; this driver uses physical addresses, so give
++	 * SID 0 a free stream-match entry whose S2CR is BYPASS (type 1), as arm-smmu does for streams with
++	 * qcom,smmu-s1-bypass: S2CR first, then the valid SMR (arm_smmu_write_sme order). sweetusbsmmu=0 skips it.
++	 */
++	int bypass = 1;
++	PE_parse_boot_argn("sweetusbsmmu", &bypass, sizeof(bypass));
++	if (!bypass || matched != 0 || (scr0 & 1u) || !((scr0 >> 10) & 1u)) {
++		return;
++	}
++	for (unsigned n = 0; n < nsmr && n < 128; n++) {
++		if (usb_rd(smmu, 0x800 + 4 * n) & (1u << 31)) {
++			continue;
++		}
++		*(volatile uint32_t *)(smmu + 0xc00 + 4 * n) = 1u << 16;        /* S2CR: TYPE bypass */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(smmu + 0x800 + 4 * n) = 1u << 31;        /* SMR: valid, ID 0, mask 0 */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET USB: SID 0 bypass in free entry %u: SMR 0x%08x S2CR 0x%08x\n", n,
++		    usb_rd(smmu, 0x800 + 4 * n), usb_rd(smmu, 0xc00 + 4 * n));
++		return;
++	}
++	printf("SWEET USB: no free SMR for SID 0: DMA will fault, not starting\n");
++	sweet_usb_smmu_blocked = true;
+ }
+ 
+ void
+@@ -154,7 +181,9 @@
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+ 		sweet_usb_smmu_report();
+-		sweet_usb_gadget_start(dwc);
++		if (!sweet_usb_smmu_blocked) {
++			sweet_usb_gadget_start(dwc);
++		}
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
