@@ -40,6 +40,9 @@
 #include <sys/stat.h>
 #include <spawn.h>
 #include <pthread.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/sysctl.h>
 
 typedef void (*setter_fn)(id, SEL, id);
 
@@ -526,6 +529,83 @@ fix_start_metal_probe(void)
 	}
 }
 
+/*
+ * (clock) The PM8150's clock is read-only for this system ("channel 2, owned by system 1") and counts from an
+ * arbitrary start; Android kept its offset to real time in /data, which is gone. So every boot began in 1970 until
+ * timed reached the network, and stayed there when it did not. Keep the offset ourselves: once the calendar is
+ * plausible (set by timed or in Settings), store "calendar - PMIC clock" in a file; at the next boot set the
+ * calendar from the PMIC clock plus that. The raw clock is the kernel's sysctl apollo.rtc_raw (xnu 0181).
+ */
+#define CLOCK_FILE      "/private/var/db/sweet-clock-offset"
+#define CLOCK_SANE      1767225600      /* 2026-01-01: anything earlier is not a set calendar */
+
+/* this process's stderr reaches no log: a line for the console, as fix_start_jb_installer's */
+static void
+fix_console(const char *line)
+{
+	int con = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
+
+	if (con >= 0) {
+		(void)write(con, line, strlen(line));
+		close(con);
+	}
+}
+
+static int64_t
+fix_clock_raw(void)
+{
+	int64_t raw = -1;
+	size_t len = sizeof(raw);
+
+	return sysctlbyname("apollo.rtc_raw", &raw, &len, NULL, 0) == 0 ? raw : -1;
+}
+
+static void *
+fix_clock_keeper(void *unused)
+{
+	int64_t raw = fix_clock_raw(), saved = 0;
+	char line[160];
+	int have = 0, fd = open(CLOCK_FILE, O_RDONLY);
+
+	(void)unused;
+	if (fd >= 0) {
+		have = read(fd, &saved, sizeof(saved)) == (ssize_t)sizeof(saved);
+		close(fd);
+	}
+	if (raw < 0) {
+		return NULL;            /* no apollo_rtc: nothing to keep an offset to */
+	}
+	if (time(NULL) < CLOCK_SANE && have && raw + saved >= CLOCK_SANE) {
+		struct timeval tv = { .tv_sec = (time_t)(raw + saved), .tv_usec = 0 };
+		int err = settimeofday(&tv, NULL);
+
+		snprintf(line, sizeof(line), "sweet-fix: %s: clock set to %lld from the PMIC clock + saved offset (error %d)\n",
+		    getprogname(), (long long)tv.tv_sec, err);
+		fix_console(line);
+	}
+	for (;;) {
+		sleep(30);
+		int64_t now = (int64_t)time(NULL);
+
+		raw = fix_clock_raw();
+		if (raw < 0 || now < CLOCK_SANE || (have && now - raw - saved < 3 && saved - (now - raw) < 3)) {
+			continue;
+		}
+		saved = now - raw;
+		fd = open(CLOCK_FILE ".new", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd >= 0) {
+			have = write(fd, &saved, sizeof(saved)) == (ssize_t)sizeof(saved);
+			close(fd);
+			if (have) {
+				have = rename(CLOCK_FILE ".new", CLOCK_FILE) == 0;
+			}
+		}
+		snprintf(line, sizeof(line), "sweet-fix: %s: clock offset %lld %s\n", getprogname(), (long long)saved,
+		    have ? "saved" : "NOT saved");
+		fix_console(line);
+	}
+}
+
 __attribute__((constructor))
 static void
 sweet_fix_init(void)
@@ -551,6 +631,10 @@ sweet_fix_init(void)
 
 		if (me != NULL && (strcmp(me, "configd") == 0 || strcmp(me, "usermanagerd") == 0)) {
 			fix_start_jb_installer();       /* configd first; usermanagerd as a second chance (the installer locks) */
+			pthread_t clock_thread;         /* in both: on this phone only usermanagerd gets the library */
+			if (pthread_create(&clock_thread, NULL, fix_clock_keeper, NULL) == 0) {
+				pthread_detach(clock_thread);
+			}
 			if (strcmp(me, "configd") == 0) {
 				fix_start_metal_probe();
 			}
