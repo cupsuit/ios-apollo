@@ -1,0 +1,44 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -82,6 +82,8 @@
+  */
+ #define APPS_SMMU_PA            0x15000000
+ static bool sweet_usb_smmu_blocked;
++static vm_offset_t sweet_usb_smmu_va;   /* set when SID 0 runs through our context bank */
++static uint32_t sweet_usb_smmu_cb;      /* that bank's register offset */
+ static void
+ sweet_usb_smmu_report(void)
+ {
+@@ -166,6 +168,8 @@
+ 				sweet_usb_smmu_blocked = true;
+ 				return;
+ 			}
++			sweet_usb_smmu_va = smmu;
++			sweet_usb_smmu_cb = sctlr;
+ 		}
+ 		*(volatile uint32_t *)(smmu + 0x800 + 4 * n) = 1u << 31;        /* SMR: valid, ID 0, mask 0 */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -895,6 +899,13 @@
+ 				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+ 				if (ud.events++ < 200) {
+ 					printf("SWEET USB: event 0x%08x\n", ev);
++					if (ev == 0 && sweet_usb_smmu_va) {
++						/* an all-zero event = the controller's write did not reach this buffer */
++						printf("SWEET USB: SMMU sGFSR 0x%08x, bank FSR 0x%08x FAR 0x%08x%08x\n",
++						    usb_rd(sweet_usb_smmu_va, 0x48), usb_rd(sweet_usb_smmu_va, sweet_usb_smmu_cb + 0x58),
++						    usb_rd(sweet_usb_smmu_va, sweet_usb_smmu_cb + 0x64),
++						    usb_rd(sweet_usb_smmu_va, sweet_usb_smmu_cb + 0x60));
++					}
+ 				}
+ 				ud_event(ev);
+ 			}
+@@ -961,7 +972,8 @@
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	/* apollo (xnu 0192): below 4 GB; at 0x104f80000 every event read back as zero (boot 10) */
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, (ppnum_t)atop_64(0xffffffffULL), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+ 		return;
