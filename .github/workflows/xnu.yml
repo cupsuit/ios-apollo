@@ -164,6 +164,25 @@ jobs:
           restore-keys: |
             xnu-ccache-${{ runner.os }}-${{ runner.arch }}-${{ env.MACOS_VERSION }}-
 
+      # Two things build.sh redoes on every run and no patch of ours changes: the KDK (downloaded and
+      # installed, ~75 s) and the host tools mig and ctfconvert/ctfdump/ctfmerge (~85 s). build.sh skips each
+      # when it is already there (KDKROOT from the environment; find fakeroot -name mig / ctfmerge).
+      - uses: actions/cache@v4
+        id: prebuilt
+        with:
+          path: prebuilt
+          key: xnu-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ env.MACOS_VERSION }}-${{ env.DXB_SHA }}-v1
+
+      - name: Use the cached KDK and host tools
+        if: steps.prebuilt.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p dxb/fakeroot
+          tar xzf prebuilt/hosttools.tgz -C dxb/fakeroot
+          kdk=$(ls -d "$PWD"/prebuilt/KDK_*.kdk | head -1)
+          test -d "$kdk/System/Library/KernelSupport"
+          echo "KDKROOT=$kdk" >> "$GITHUB_ENV"
+          echo "KDKROOT=$kdk"; tar tzf prebuilt/hosttools.tgz
+
       - name: Build
         working-directory: dxb
         env:
@@ -177,6 +196,17 @@ jobs:
           ccache -z
           bash build.sh 2>&1 | tee ../build.log
           ccache -s
+
+      - name: Keep the KDK and host tools for the next run
+        if: steps.prebuilt.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p prebuilt
+          (cd dxb/fakeroot && find . -type f -perm +111 \( -name 'mig*' -o -name 'ctf*' \) | tar czf ../../prebuilt/hosttools.tgz -T -)
+          tar tzf prebuilt/hosttools.tgz
+          tar tzf prebuilt/hosttools.tgz | grep -q '/mig$'
+          tar tzf prebuilt/hosttools.tgz | grep -q '/ctfmerge$'
+          cp -R /Library/Developer/KDKs/KDK_*.kdk prebuilt/
+          du -sh prebuilt/*
 
       # The full log is too long to read the errors from its tail: repeat them at the end.
       - name: Compile errors
@@ -235,7 +265,7 @@ jobs:
         if: always()
         run: |
           mkdir -p out/kdk-libs
-          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a prebuilt/KDK_*.kdk/System/Library/KernelSupport/lib*.a; do
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
