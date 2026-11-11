@@ -1,0 +1,63 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -85,7 +85,7 @@
+ static void
+ sweet_usb_smmu_report(void)
+ {
+-	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, 0x1000);
++	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, 0x100000);
+ 	if (smmu == 0) {
+ 		printf("SWEET USB: apps SMMU map failed\n");
+ 		return;
+@@ -126,9 +126,50 @@
+ 		}
+ 		*(volatile uint32_t *)(smmu + 0xc00 + 4 * n) = 1u << 16;        /* S2CR: TYPE bypass */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		if (((usb_rd(smmu, 0xc00 + 4 * n) >> 16) & 3u) != 1u) {
++			/*
++			 * apollo (xnu 0191): boot 9 read the bypass S2CR back as type 2 (fault): this firmware does
++			 * not keep bypass entries. Mainline Linux meets the same on these SoCs and handles it in
++			 * arm-smmu-qcom.c (qcom_smmu_cfg_probe, bypass_quirk): the last context bank is set up with
++			 * stage-1 translation off (SCTLR 0, CBAR type S1_TRANS_S2_BYPASS) and such streams get a
++			 * normal translate S2CR pointing at it. Same here. Layout from IDR1: page size bit 31,
++			 * NUMPAGENDXB 30:28, NUMCB 7:0; GR1 is page 1, context bank c is page (numpage + c).
++			 */
++			uint32_t idr1 = usb_rd(smmu, 0x24);
++			uint32_t pg = (idr1 >> 31) ? 0x10000u : 0x1000u, npg = 1u << (((idr1 >> 28) & 7u) + 1);
++			uint32_t cb = (idr1 & 0xffu) - 1;
++			uint32_t cbar = pg + 4 * cb, sctlr = (npg + cb) * pg;
++			if ((idr1 & 0xffu) == 0 || sctlr + 4 > 0x100000u) {
++				printf("SWEET USB: apps SMMU IDR1 0x%08x: no usable context bank, not starting\n", idr1);
++				sweet_usb_smmu_blocked = true;
++				return;
++			}
++			for (unsigned m = 0; m < nsmr && m < 128; m++) {
++				uint32_t o = usb_rd(smmu, 0xc00 + 4 * m);
++				if ((usb_rd(smmu, 0x800 + 4 * m) & (1u << 31)) && ((o >> 16) & 3u) == 0 && (o & 0xffu) == cb) {
++					printf("SWEET USB: context bank %u is in use by SMR%u, not starting\n", cb, m);
++					sweet_usb_smmu_blocked = true;
++					return;
++				}
++			}
++			printf("SWEET USB: IDR1 0x%08x, context bank %u before: CBAR 0x%08x SCTLR 0x%08x\n", idr1, cb,
++			    usb_rd(smmu, cbar), usb_rd(smmu, sctlr));
++			*(volatile uint32_t *)(smmu + sctlr) = 0;                       /* translation off */
++			*(volatile uint32_t *)(smmu + cbar) = 1u << 16;                 /* S1_TRANS_S2_BYPASS */
++			*(volatile uint32_t *)(smmu + 0xc00 + 4 * n) = cb;              /* S2CR: TYPE translate, CBNDX */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			uint32_t back = usb_rd(smmu, 0xc00 + 4 * n);
++			printf("SWEET USB: context bank %u after: CBAR 0x%08x SCTLR 0x%08x, S2CR%u 0x%08x\n", cb,
++			    usb_rd(smmu, cbar), usb_rd(smmu, sctlr), n, back);
++			if (((back >> 16) & 3u) != 0 || (back & 0xffu) != cb || (usb_rd(smmu, sctlr) & 1u)) {
++				printf("SWEET USB: the context bank did not take, not starting\n");
++				sweet_usb_smmu_blocked = true;
++				return;
++			}
++		}
+ 		*(volatile uint32_t *)(smmu + 0x800 + 4 * n) = 1u << 31;        /* SMR: valid, ID 0, mask 0 */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("SWEET USB: SID 0 bypass in free entry %u: SMR 0x%08x S2CR 0x%08x\n", n,
++		printf("SWEET USB: SID 0 in free entry %u: SMR 0x%08x S2CR 0x%08x\n", n,
+ 		    usb_rd(smmu, 0x800 + 4 * n), usb_rd(smmu, 0xc00 + 4 * n));
+ 		return;
+ 	}
