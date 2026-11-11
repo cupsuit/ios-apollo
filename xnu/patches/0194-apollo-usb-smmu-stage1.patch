@@ -1,0 +1,107 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -84,6 +84,8 @@
+ static bool sweet_usb_smmu_blocked;
+ static vm_offset_t sweet_usb_smmu_va;   /* set when SID 0 runs through our context bank */
+ static vm_offset_t sweet_usb_smmu_bank; /* that bank's registers */
++static vm_offset_t sweet_usb_smmu_gr1;  /* global space 1 (CBAR, CBA2R) */
++static uint32_t sweet_usb_smmu_cbn;     /* the bank's number */
+ static void
+ sweet_usb_smmu_report(void)
+ {
+@@ -177,6 +179,8 @@
+ 			}
+ 			sweet_usb_smmu_va = smmu;
+ 			sweet_usb_smmu_bank = bank;
++			sweet_usb_smmu_gr1 = gr1;
++			sweet_usb_smmu_cbn = cb;
+ 		}
+ 		*(volatile uint32_t *)(smmu + 0x800 + 4 * n) = 1u << 31;        /* SMR: valid, ID 0, mask 0 */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -972,6 +976,75 @@
+ 	}
+ }
+ 
++/*
++ * apollo (xnu 0194): boot 12 showed that a context bank with translation off is not a pass-through on this
++ * firmware: every controller access raised a translation fault in the bank (FSR 0x2, FAR = the TRB's address,
++ * 0x104f81000), so the controller saw nothing and the host got no descriptor. So translate for real, the way
++ * sweet_gpu.c's gpu_smmu_context() does for the GPU's SMMU (same register values): stage 1, 39 bits, 4K
++ * pages, three table levels, and the DMA block mapped at its own physical address so the driver's addresses
++ * stay as they are.
++ */
++static bool
++sweet_usb_smmu_map(uint64_t pa, uint32_t size)
++{
++	vm_offset_t bank = sweet_usb_smmu_bank, gr1 = sweet_usb_smmu_gr1, tv = 0;
++	uint32_t cb = sweet_usb_smmu_cbn;
++
++	if (bank == 0) {
++		return true;            /* the stream does not go through a bank of ours */
++	}
++	if ((pa >> 36) || ((pa ^ (pa + size - 1)) >> 21)) {
++		printf("SWEET USB: DMA block 0x%llx does not fit one table\n", pa);
++		return false;
++	}
++	if (kmem_alloc_contig(kernel_map, &tv, 0x4000, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)tv);
++	if (!pn) {
++		return false;
++	}
++	uint64_t tp = ptoa_64(pn);
++	volatile uint64_t *l1 = (volatile uint64_t *)tv, *l2 = (volatile uint64_t *)(tv + 0x1000),
++	    *l3 = (volatile uint64_t *)(tv + 0x2000);
++	l1[(pa >> 30) & 0x1ff] = (tp + 0x1000) | 3;
++	l2[(pa >> 21) & 0x1ff] = (tp + 0x2000) | 3;
++	for (uint32_t o = 0; o < size; o += 0x1000) {
++		/* page, AP[1] unprivileged too, inner shareable, accessed, not global; attribute 0 of MAIR0 */
++		l3[((pa + o) >> 12) & 0x1ff] = (pa + o) | 3 | (1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11);
++	}
++	flush_dcache64((addr64_t)tp, 0x3000, TRUE);
++
++	uint64_t root = tp | ((uint64_t)cb << 48);
++#define SMMU_WR(base, off, v)   (*(volatile uint32_t *)((base) + (off)) = (v))
++	SMMU_WR(bank, 0x00, 0);                                         /* SCTLR off while set up */
++	SMMU_WR(gr1, 0x800 + 4 * cb, 1);                                /* CBA2R: 64-bit tables */
++	SMMU_WR(gr1, 4 * cb, (1u << 16) | (3u << 8) | (0xfu << 12));    /* CBAR: stage 1 */
++	SMMU_WR(bank, 0x10, 1u | (1u << 4) | (7u << 15));               /* TCR2: 36-bit PA, 16-bit ASID */
++	SMMU_WR(bank, 0x30, 25u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23));    /* TCR: 39 bits */
++	SMMU_WR(bank, 0x20, (uint32_t)root);                            /* TTBR0 */
++	SMMU_WR(bank, 0x24, (uint32_t)(root >> 32));
++	SMMU_WR(bank, 0x28, 0);                                         /* TTBR1 */
++	SMMU_WR(bank, 0x2c, 0);
++	SMMU_WR(bank, 0x38, 0xf404ff44u);                               /* MAIR0: 0 non-cacheable */
++	SMMU_WR(bank, 0x3c, 0);
++	SMMU_WR(bank, 0x58, 0xc00001feu);                               /* FSR: clear */
++	SMMU_WR(bank, 0x610, cb);                                       /* TLBIASID */
++	SMMU_WR(bank, 0x7f0, 1);                                        /* TLBSYNC */
++	for (unsigned i = 0; i < 100 && (usb_rd(bank, 0x7f4) & 1u); i++) {
++		delay(10);
++	}
++	SMMU_WR(bank, 0x00, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 12));
++#undef SMMU_WR
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t on = usb_rd(bank, 0x00);
++	printf("SWEET USB: context bank %u translates 0x%llx+0x%x: tables 0x%llx, SCTLR 0x%08x CBAR 0x%08x "
++	    "TTBR0 0x%08x%08x TCR 0x%08x FSR 0x%08x\n", cb, pa, size, tp, on, usb_rd(gr1, 4 * cb),
++	    usb_rd(bank, 0x24), usb_rd(bank, 0x20), usb_rd(bank, 0x30), usb_rd(bank, 0x58));
++	return (on & 1u) != 0;
++}
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -989,6 +1062,10 @@
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	if (!sweet_usb_smmu_map(ud.dma_pa, UD_SIZE)) {
++		printf("SWEET USB: the SMMU does not translate for the controller, not starting\n");
++		return;
++	}
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
