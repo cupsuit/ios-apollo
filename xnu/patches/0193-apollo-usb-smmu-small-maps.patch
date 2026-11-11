@@ -1,0 +1,76 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -83,11 +83,11 @@
+ #define APPS_SMMU_PA            0x15000000
+ static bool sweet_usb_smmu_blocked;
+ static vm_offset_t sweet_usb_smmu_va;   /* set when SID 0 runs through our context bank */
+-static uint32_t sweet_usb_smmu_cb;      /* that bank's register offset */
++static vm_offset_t sweet_usb_smmu_bank; /* that bank's registers */
+ static void
+ sweet_usb_smmu_report(void)
+ {
+-	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, 0x100000);
++	vm_offset_t smmu = ml_io_map(APPS_SMMU_PA, 0x1000);
+ 	if (smmu == 0) {
+ 		printf("SWEET USB: apps SMMU map failed\n");
+ 		return;
+@@ -154,22 +154,30 @@
+ 					return;
+ 				}
+ 			}
++			/* apollo (xnu 0193): one page each, not the whole 1 MB (that exhausted the I/O map: boots 10, 11) */
++			vm_offset_t gr1 = ml_io_map(APPS_SMMU_PA + pg, 0x1000), bank = ml_io_map(APPS_SMMU_PA + sctlr, 0x1000);
++			if (gr1 == 0 || bank == 0 || cbar + 4 > 2 * pg) {
++				printf("SWEET USB: apps SMMU context bank map failed, not starting
++");
++				sweet_usb_smmu_blocked = true;
++				return;
++			}
+ 			printf("SWEET USB: IDR1 0x%08x, context bank %u before: CBAR 0x%08x SCTLR 0x%08x\n", idr1, cb,
+-			    usb_rd(smmu, cbar), usb_rd(smmu, sctlr));
+-			*(volatile uint32_t *)(smmu + sctlr) = 0;                       /* translation off */
+-			*(volatile uint32_t *)(smmu + cbar) = 1u << 16;                 /* S1_TRANS_S2_BYPASS */
++			    usb_rd(gr1, 4 * cb), usb_rd(bank, 0));
++			*(volatile uint32_t *)bank = 0;                       /* translation off */
++			*(volatile uint32_t *)(gr1 + 4 * cb) = 1u << 16;                 /* S1_TRANS_S2_BYPASS */
+ 			*(volatile uint32_t *)(smmu + 0xc00 + 4 * n) = cb;              /* S2CR: TYPE translate, CBNDX */
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+ 			uint32_t back = usb_rd(smmu, 0xc00 + 4 * n);
+ 			printf("SWEET USB: context bank %u after: CBAR 0x%08x SCTLR 0x%08x, S2CR%u 0x%08x\n", cb,
+-			    usb_rd(smmu, cbar), usb_rd(smmu, sctlr), n, back);
+-			if (((back >> 16) & 3u) != 0 || (back & 0xffu) != cb || (usb_rd(smmu, sctlr) & 1u)) {
++			    usb_rd(gr1, 4 * cb), usb_rd(bank, 0), n, back);
++			if (((back >> 16) & 3u) != 0 || (back & 0xffu) != cb || (usb_rd(bank, 0) & 1u)) {
+ 				printf("SWEET USB: the context bank did not take, not starting\n");
+ 				sweet_usb_smmu_blocked = true;
+ 				return;
+ 			}
+ 			sweet_usb_smmu_va = smmu;
+-			sweet_usb_smmu_cb = sctlr;
++			sweet_usb_smmu_bank = bank;
+ 		}
+ 		*(volatile uint32_t *)(smmu + 0x800 + 4 * n) = 1u << 31;        /* SMR: valid, ID 0, mask 0 */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -902,9 +910,8 @@
+ 					if (ev == 0 && sweet_usb_smmu_va) {
+ 						/* an all-zero event = the controller's write did not reach this buffer */
+ 						printf("SWEET USB: SMMU sGFSR 0x%08x, bank FSR 0x%08x FAR 0x%08x%08x\n",
+-						    usb_rd(sweet_usb_smmu_va, 0x48), usb_rd(sweet_usb_smmu_va, sweet_usb_smmu_cb + 0x58),
+-						    usb_rd(sweet_usb_smmu_va, sweet_usb_smmu_cb + 0x64),
+-						    usb_rd(sweet_usb_smmu_va, sweet_usb_smmu_cb + 0x60));
++						    usb_rd(sweet_usb_smmu_va, 0x48), usb_rd(sweet_usb_smmu_bank, 0x58),
++						    usb_rd(sweet_usb_smmu_bank, 0x64), usb_rd(sweet_usb_smmu_bank, 0x60));
+ 					}
+ 				}
+ 				ud_event(ev);
+@@ -972,8 +979,8 @@
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	/* apollo (xnu 0192): below 4 GB; at 0x104f80000 every event read back as zero (boot 10) */
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, (ppnum_t)atop_64(0xffffffffULL), 0,
++	/* apollo (xnu 0193): 0192 asked for memory below 4 GB; xnu has none free here (boot 11) */
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+ 		return;
